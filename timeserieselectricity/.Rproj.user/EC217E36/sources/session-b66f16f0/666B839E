@@ -1,0 +1,27 @@
+{
+    "id": "666B839E",
+    "path": "~/GitHub/TimeSeriesElectricity/timeserieselectricity/EDA_Report.qmd",
+    "project_path": "EDA_Report.qmd",
+    "type": "quarto_markdown",
+    "hash": "0",
+    "contents": "",
+    "dirty": false,
+    "created": 1733183447281.0,
+    "source_on_save": false,
+    "relative_order": 1,
+    "properties": {
+        "source_window_id": "",
+        "Source": "Source",
+        "cursorPosition": "298,0",
+        "scrollLine": "25",
+        "last_setup_crc32": "b66f16f0534ff0ca"
+    },
+    "folds": "",
+    "lastKnownWriteTime": 1733184016,
+    "encoding": "UTF-8",
+    "collab_server": "",
+    "source_window": "",
+    "last_content_update": 1733184016,
+    "read_only": false,
+    "read_only_alternatives": []
+}

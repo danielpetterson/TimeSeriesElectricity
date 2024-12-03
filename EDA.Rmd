@@ -1,0 +1,670 @@
+---
+title: "Draft EDA"
+output:
+  html_document:
+    df_print: paged
+    toc: true
+    toc_depth: 4
+    toc_float: TRUE
+---
+
+### Next steps
+
+-   Investigate seasonality
+-   Improve plotting of interpolated regions
+
+### Initial import
+
+```{r libraries, message=FALSE, warning=FALSE, error=FALSE}
+# Load libraries
+library(RCurl)
+library(tidyverse)
+library(magrittr)
+library(plotly)
+library(imputeTS)
+library(lubridate)
+library(timetk)
+library(ggcorrplot)
+library(gridExtra)
+```
+
+```{r echo=TRUE}
+# Load data (relative file path)
+df <- read.csv("../data/energy_dataset.csv")
+
+# Formatting time variable to datetime object
+# NB:  Time contains both UTC+1 and UTC+2 time-zones - date functions automatically pick this up and convert to UTC
+
+df$time <- as_datetime(df$time, tz="CET")
+head(df)
+```
+
+```{r}
+dim(df) # Number of rows and columns
+```
+
+```{r}
+names(df)
+summary(df) # Distribution and missingness for each variable
+```
+
+### Missing data
+
+There are eight columns that contain no values (all NAs or zeroes). These are removed here.
+
+```{r}
+df <- df %>% 
+  select(-c(generation.fossil.coal.derived.gas,
+            generation.fossil.oil.shale,
+            generation.fossil.peat,
+            generation.geothermal,
+            generation.marine,
+            generation.hydro.pumped.storage.aggregated,
+            generation.wind.offshore,
+            forecast.wind.offshore.eday.ahead,
+            total.load.actual)) # Removing this one too as we're not analysing it
+```
+
+We also find three rows where there are anomalous zero values for every generation source apart from Gas. These look as if they should be missing rather than a true 0 value. I've also found two other rows where there is a strange drop off in electricity generation - these were found by calculating the total power for each row, as shown below.
+
+```{r}
+total_power <- df %>% 
+  select(c(1, starts_with("generation"))) %>%
+  pivot_longer(cols = -time, names_to = "generation_source", values_to = 'value') %>%
+  #group_by(generation_source) %>%
+  summarise_by_time(time, .by = 'hour', total_power = sum(value)) %>%
+  arrange(total_power)
+
+boxplot(total_power$total_power, main = 'Box plot of hourly total power')
+total_power #Most extreme values
+  
+```
+
+Here you can see the three rows corresponding to the three most extreme total power values
+```{r}
+df %>% filter_by_time(time, '2017-11-12 20:00:00', '2017-11-14 18:30:00')
+```
+Here the outliers for the 5 most extreme rows are removed (these have been checked visually that they are in fact most likely incorrect measurements)
+
+```{r}
+outlier_rows <- df %>% filter(time %in% ymd_hms('2017-11-12 20:00:00', '2017-11-14 11:00:00', '2017-11-14 18:00:00'))
+
+outlier_rows[outlier_rows == 0] <- NA
+outlier_rows
+
+df[df$time %in% ymd_hms('2017-11-12 20:00:00', '2017-11-14 11:00:00', '2017-11-14 18:00:00'),] <- outlier_rows
+```
+
+
+
+```{r}
+colSums(is.na(df)) # Number of missing values for each remaining variable
+```
+
+16 out of 22 of the remaining variables each have a maximum of 36 missing values. Looking at where these occur, we see that most missing values occur across variables. Specifically, 90% of the missing values occur over only 18 rows. The remaining 10% are spread across 28 rows.
+
+```{r}
+# Rows where data is missing
+df[!complete.cases(df),]
+```
+
+```{r}
+# Number of NAs per row
+missing_per_row <- rowSums(is.na(df[!complete.cases(df),]))
+missing_per_row
+sum(missing_per_row > 1)
+```
+
+
+```{r}
+sum(missing_per_row[missing_per_row > 1])/sum(missing_per_row)
+```
+
+We can visualise where in the series the missing values occur using the following function:
+
+```{r}
+ggplot_na_distribution(df$generation.biomass)
+```
+
+However, this only allows us to look at one variable at a time. There are other functions in the imputeTS package which can be useful for investigating missingness in a (univariate) time series.
+
+We have decided to interpolate the missing values using linear interpolation. The only places where this might be an issue is where are two gaps of length 6 and 8. These will be visualised below.
+
+```{r}
+# Interpolate missing values using linear interpolation
+df_clean <- df %>% mutate(across(generation.biomass:price.actual, .fns = na_interpolation, option = 'linear'))
+
+# Verifying missing values have been filled
+df_clean[!complete.cases(df_clean),]
+```
+
+Visualising interpolation
+
+```{r}
+# Creating a 'missing' flag to indicate imputation
+df_clean$interp_biomass <- as.integer(is.na(df$generation.biomass))
+
+ggplot(data = df_clean[90:150,]) + geom_line(aes(x=time, y = generation.biomass, colour = interp_biomass), show.legend = FALSE) + scale_color_gradient(low="black", high="red") + labs(title = "Example of linear interpolation (in red) applied to the dataset")
+```
+
+**What are we left with in df_clean?**
+
+35,000 obs across 20 variables, hourly from start 2015 to end 2018:
+
+-   Energy generation from 14 different sources
+
+-   Forecast onshore wind and solar, one day ahead
+
+-   Forecast and actual total electricity load
+
+-   Forecast and actual electricity price
+
+And in the other dataset, not yet loaded: hourly weather data over the same period for a number of Spanish cities
+
+
+
+### Investigating generation methods
+
+```{r}
+gen_data <- df_clean %>% 
+  select(c(1, starts_with("generation")))
+
+# Giving vars simpler names
+names(gen_data) <- c("time",
+                     "Biomass",
+                    "Lignite",
+                    "Gas",
+                    "Hard Coal",
+                    "Oil",
+                    "Hydro Pumped",
+                    "Hydro River",
+                    "Hydro Reservoir",
+                    "Nuclear",
+                    "Other",
+                    "Other Renewable",
+                    "Solar",
+                    "Waste",
+                    "Wind") #Renaming from Wind Onshore as no other wind var
+```
+
+```{r}
+# Converting to long form, grouping
+long_gen_data <- gen_data  %>% 
+  pivot_longer(cols = -time, names_to = "generation_source") %>%
+  group_by(generation_source)
+
+head(long_gen_data)
+```
+
+### Investigating total generation over time
+```{r}
+total_power <- long_gen_data %>% ungroup() %>%
+  summarise_by_time(time, .by = 'hour', total_power = sum(value)) %>%
+  arrange(total_power)
+
+boxplot(total_power$total_power, main = 'Box plot of hourly total power')
+total_power #Most extreme values
+
+total_power %>%
+  summarise_by_time(time, .by = 'month', adjusted = sum(total_power)) %>% 
+ plot_time_series(time, adjusted, .title = 'Total power generated each month, all sources', .y_lab = 'Power (MW)')
+  #plot_seasonal_diagnostics(time, adjusted)
+  #ggplot() + geom_line(aes(x = time, y = adjusted)) + ylim(0, 2.5e7)
+```
+
+
+#### Overall statistics
+
+```{r}
+overall_stats <- long_gen_data %>%
+  summarise(sum = sum(value, na.rm = TRUE),
+            mean = mean(value, na.rm = TRUE),
+            sd = sd(value, na.rm = TRUE),
+            max = max(value, na.rm = TRUE)) %>%
+  mutate(generation_source= fct_reorder(generation_source, desc(sum)))
+
+sources_by_sum <- arrange(overall_stats, desc(sum))
+sources_by_sum
+
+ggplot(data = overall_stats) + geom_col(aes(x = generation_source, y = sum)) + theme(axis.text.x = element_text(angle=90)) + labs(title = "Total electricity generated by source")
+
+sources_by_sum %>% pivot_longer(cols = c(sum, mean, sd, max), names_to = "stat", 
+                                values_to = "value") %>%
+  filter(stat != "sum") %>%
+  ggplot() + geom_col(aes(x = generation_source, y = value, fill = stat), position = "dodge") + theme(axis.text.x = element_text(angle=90)) + labs(title = "Other overall hourly statistics of each source")
+```
+
+These plots show that nuclear generation has produced the most electricity over the time series, and has the highest mean hourly value. Nuclear is also a very steady generation method, having the smallest standard deviation out of the top six generation sources. Gas has the second highest total and mean generation, and the highest maximum value in an hour. Wind, the third largest contributor, is the most variable generation source, and has the second highest maximum hourly value.
+
+Using this information to re-factor the generation_source variable, so that plots will order the sources from most to least important.
+
+```{r}
+long_gen_data$generation_source <- factor(long_gen_data$generation_source, levels =  sources_by_sum$generation_source)
+```
+
+Smoothing the data on a daily scale
+
+```{r}
+gen_data_smoothed <- long_gen_data %>% 
+  summarise_by_time(time, .by = 'week', adjusted = mean(value)) 
+
+head(gen_data_smoothed)
+```
+
+#### Individual time series plots
+
+Looking at each series over time in isolation, with quarterly smoothing (This function is nice as it includes an interactive feature)
+
+```{r}
+gen_data_smoothed %>% 
+  filter(generation_source %in% sources_by_sum$generation_source[1:6]) %>% 
+  plot_time_series(time, adjusted, .facet_ncol = 3,
+                   .smooth_period = "12 months", .facet_scales='fixed',
+                   .title= "Weekly averages for six biggest generation sources + 12-month smoothing")
+
+gen_data_smoothed %>% 
+  filter(generation_source %in% sources_by_sum$generation_source[7:14]) %>% 
+  plot_time_series(time, adjusted, .facet_ncol = 3, .line_size = 0.01,
+                   .smooth_period = "12 months", .facet_scales='fixed',
+                   .title= "Weekly averages for six smallest generation sources + 12-month smoothing")
+```
+
+```{r}
+gen_data_smoothed %>% 
+  filter(generation_source %in% sources_by_sum$generation_source[1:6]) %>% 
+  ggplot() + geom_smooth(aes(x = time, y = adjusted), method = 'loess', span = 0.7, se = FALSE)  + facet_wrap(~generation_source, scales = 'fixed')
+
+gen_data_smoothed %>% 
+  filter(generation_source %in% sources_by_sum$generation_source[7:14]) %>% 
+  ggplot() + geom_smooth(aes(x = time, y = adjusted), method = 'loess', span = 0.7, se = FALSE)  + facet_wrap(~generation_source, scales = 'fixed')
+```
+
+
+These plots emphasise the relatively steady week-to-week electricity generation from nuclear over the time period, compared with the high variability in wind and gas (note that each row has the same y-axis). Solar shows a strong seasonal pattern within each year, peaking in July (summer) and reaching a low in December (winter) each year. All hydro sources appears to show seasonality on a two-year scale.
+
+In terms of long-term trends, biomass, oil, and "other" all show a similar decrease in production at the start of 2016, followed by a steady period until the end of the series. Meanwhile, Waste and Other Renewable show a similar increasing trend over the four year period. Gas increases slightly, whereas Hard Coal decreased slightly. Nuclear, Wind, Solar, Lignite, and all Hydro sources are steady.
+
+```{r}
+daily_totals <- long_gen_data %>%
+  summarise_by_time(time, .by = 'day', total = sum(value))
+
+daily_totals %>% filter(generation_source=='Solar') %>%
+  plot_time_series(time, total, .smooth_period = 'quarter')
+```
+
+
+#### Stacked area plots
+
+```{r}
+long_gen_data %>%
+  summarise_by_time(time, .by = '3 months', adjusted = mean(value)) %>% 
+  ggplot() + 
+  geom_area(aes(x = time, y = adjusted, fill = generation_source), stat = "identity")
+```
+
+```{r}
+# Proportions
+gen_data_props <- cbind(gen_data[1], prop.table(as.matrix(gen_data[-1]), margin = 1))
+
+long_gen_data_props <- gen_data_props %>% 
+  pivot_longer(cols = -time, names_to = "generation_source") 
+
+# Ordering sources by importance
+long_gen_data_props$generation_source <- factor(long_gen_data_props$generation_source, levels =  sources_by_sum$generation_source)
+
+long_gen_data_props %>%
+  group_by(generation_source) %>% 
+  summarise_by_time(time, .by = '3 months', adjusted = mean(value)) %>% 
+  ggplot() + 
+  geom_area(aes(x = time, y = adjusted, fill = generation_source), stat = "identity") +
+  theme_minimal()
+  
+```
+
+#### Correlations
+
+```{r}
+# Correlation plot. Sample size for computational efficiency.
+df_corr <- gen_data[1:10000,2:ncol(gen_data)]
+
+corrmatrix <- df_corr %>% cor()
+ggcorrplot(corrmatrix,
+            hc.order = TRUE,
+            type = "lower",
+            lab = FALSE)
+
+# Extract individual correlations using the following:
+corrmatrix['Hard Coal', 'Hydro Pumped']
+corrmatrix['Hard Coal', 'Wind']
+corrmatrix['Hard Coal', 'Lignite']
+corrmatrix['Hydro River', 'Hydro Reservoir']
+```
+
+The most positive correlation is between Hard Coal and Lignite (0.83), followed by Hydro River and Hydro Reservoir (0.65). This makes sense given the similarity of these sources. The most negative correlation is between Hard Coal and Wind (-0.58), followed by Hard Coal and Hydro Pumped (-0.54). These relationships could reflect the variability in the generation by the renewable sources (Wind and Hydro, see figures ...), and the need to compensate with fossil fuels when generation is low. These relationships are further examined in the plots below.
+
+```{r}
+long_gen_data[1:10000,] %>% filter(generation_source %in% c('Wind', 'Hard Coal','Lignite')) %>% ungroup() %>% plot_time_series(time, value, .color_var = generation_source, .smooth = 0)
+
+long_gen_data[1:10000,] %>% filter(generation_source %in% c('Hydro Reservoir', 'Hydro River')) %>% ungroup() %>% plot_time_series(time, value, .color_var = generation_source, .smooth = 0)
+```
+
+#### Seasonality
+
+```{r}
+# Create time variables
+long_gen_data$year <- year(long_gen_data$time)
+long_gen_data$month <- month(long_gen_data$time)
+long_gen_data$day <- day(long_gen_data$time)
+long_gen_data$hour <- hour(long_gen_data$time)
+
+long_gen_data_props$year <- year(long_gen_data_props$time)
+long_gen_data_props$month <- month(long_gen_data_props$time)
+long_gen_data_props$day <- day(long_gen_data_props$time)
+long_gen_data_props$hour <- hour(long_gen_data_props$time)
+```
+
+Seasonality within a day
+
+```{r}
+hourly_generation_plot_by_year <- long_gen_data %>%
+  ggplot(aes(x = hour, y = value, fill = generation_source)) +
+  geom_bar(stat = "identity")
+
+hourly_generation_plot_by_year
+```
+
+```{r}
+# Proportions
+hourly_generation_plot_by_year_props <- long_gen_data_props %>%
+  ggplot(aes(x = hour, y = value, fill = generation_source)) +
+  geom_bar(stat = "identity")
+
+hourly_generation_plot_by_year_props
+```
+
+Seasonality within a month
+
+```{r}
+daily_generation_plot_by_year <- long_gen_data %>%
+  ggplot(aes(x = day, y = value, fill = generation_source)) +
+  geom_bar(stat = "identity") +
+  facet_wrap(~year) + theme(legend.position = "none") 
+
+daily_generation_plot_by_year
+```
+
+```{r}
+# Note: Similar problem to raw values
+daily_generation_plot_by_year_props <- long_gen_data_props %>%
+  ggplot(aes(x = day, y = value, fill = generation_source)) +
+  geom_bar(stat = "identity") +
+  facet_wrap(~year) + theme(legend.position = "none") 
+
+daily_generation_plot_by_year_props
+```
+
+Seasonality within a year
+
+```{r}
+monthly_generation_plot <- long_gen_data %>%
+  ggplot(aes(x = month, y = value, fill = generation_source)) +
+  geom_bar(stat = "identity") +
+  facet_wrap(~year)
+
+monthly_generation_plot
+```
+
+```{r}
+# Note: Shorter bars for shorter months as above
+monthly_generation_plot_props <- long_gen_data_props %>%
+  ggplot(aes(x = month, y = value, fill = generation_source)) +
+  geom_bar(stat = "identity") +
+  facet_wrap(~year)
+
+monthly_generation_plot_props
+```
+
+```{r eval=FALSE, include=FALSE}
+price_vs_forecast <- df_clean %>%
+  select(., c(time, price.actual, price.day.ahead)) 
+
+## Need to offset by a day before taking difference?
+price_vs_forecast$difference <- price_vs_forecast$price.day.ahead - price_vs_forecast$price.actual
+
+price_vs_forecast %>%
+  ggplot() +
+  geom_line(aes(x=time, y=difference)) +
+  ylab("Difference between predicted and actual price")
+```
+
+```{r eval=FALSE, include=FALSE}
+load_vs_forecast <- df_clean %>%
+  select(., c(time, total.load.actual, total.load.forecast))
+
+load_vs_forecast$difference <- load_vs_forecast$total.load.forecast - load_vs_forecast$total.load.actual
+
+load_vs_forecast %>%
+  ggplot() +
+  geom_line(aes(x=time, y=difference)) +
+  ylab("Difference between predicted and actual load")
+
+```
+
+#### Variation in maximum and minimum load
+
+##### Daily averages
+
+```{r, include=TRUE, fig.width = 14, fig.height = 36, warning=FALSE, message = FALSE}
+datain <- long_gen_data %>% group_by(generation_source, year, day, month) %>% summarise(across(c(value), c(max, min, mean)))
+
+datain <- datain %>%
+  mutate(date = make_date(year, month, day))
+p <- list()
+names <- unique(datain$generation_source)
+for(i in 1:length(names)){
+  datain2 <- filter(datain, generation_source == names[i])
+  p[[i]] <- datain2 %>% ggplot()+geom_line(aes(x = date, y = value_1, color = "max"))+geom_line(aes(x = date, y = value_2, color = "min"))+theme(legend.position="bottom")+ggtitle(names[i])+
+  stat_smooth(formula = y ~ x,method = "loess", col = "red",aes(x = date, y = value_1))+
+  stat_smooth(formula = y ~ x, method = "loess", col = "blue",aes(x = date, y = value_2)) + stat_smooth(formula = y ~ x, method = "loess", col = "green",aes(x = date, y = value_3))
+
+}
+
+do.call(grid.arrange,c(p,ncol=2))
+```
+```{r, include=TRUE, fig.width = 14, fig.height = 5, warning=FALSE, message = FALSE}
+library(seastests)
+library(ggfortify)
+library(zoo)
+library(tseries)
+library(astsa)
+library(BBmisc)
+library(forecast)
+library(ggplot2)
+datain <- long_gen_data %>% group_by(generation_source, year, month, day) %>% summarise(across(c(value), c(max, min, mean)))
+datain <- datain %>%
+  mutate(date = make_datetime(year, month, day))
+p <- list()
+names <- unique(datain$generation_source)
+for(i in 1:length(names)){
+  datain2 <- filter(datain, generation_source == names[i])
+  print(datain2$generation_source[1])
+  Vector1<-ts(as.numeric(datain2$value_3), frequency = 365, start = c(2015, 1))
+  decomposed<-decompose(Vector1,type='additive')
+  p[[i]] <- autoplot(decomposed) + ggtitle(names[i] )
+}
+do.call(grid.arrange,c(p,ncol=3)) 
+
+q <- list()
+names <- unique(datain$generation_source)
+
+datain3 <- filter(datain, generation_source == names[5])
+Vector1<-ts(as.numeric(datain3$value_3), frequency = 365, start = c(2015, 1))
+decomposed<-decompose(Vector1,type='additive')
+q[[1]] <- autoplot(decomposed) + ggtitle(names[5] )
+
+datain3 <- filter(datain, generation_source == names[7])
+Vector1<-ts(as.numeric(datain3$value_3), frequency = 365, start = c(2015, 1))
+decomposed<-decompose(Vector1,type='additive')
+q[[2]] <- autoplot(decomposed) + ggtitle(names[7] )
+
+do.call(grid.arrange,c(q,ncol=2)) 
+
+
+
+```
+```{r, include=TRUE, fig.width = 14, fig.height = 6, warning=FALSE, message = FALSE}
+library(seastests)
+library(ggfortify)
+library(zoo)
+library(tseries)
+library(astsa)
+library(BBmisc)
+library(forecast)
+library(ggplot2)
+datain <- long_gen_data %>% group_by(generation_source, year, month, day) %>% summarise(across(c(value), c(max, min, mean)))
+datain <- datain %>%
+  mutate(date = make_datetime(year, month, day))
+p <- list()
+names <- unique(datain$generation_source)
+temp <- list()
+for(i in 1:length(names)){
+  datain2 <- filter(datain, generation_source == names[i])
+  print(datain2$generation_source[1])
+  Vector1<-ts(as.numeric(datain2$value_3), frequency = 365, start = c(2015, 1))
+  decomposed<-decompose(Vector1,type='additive')
+  summary(decomposed)
+  temp[[i]] <- decomposed$trend
+  p[[i]] <- autoplot(decomposed) + ggtitle(names[i] )
+}
+
+temp[[]] %>% 
+  ggplot()+
+  geom_line(aes(x = 1:length(temp[[2]])/365 + 2015, y = normalize(as.numeric(temp[[2]]), method = "standardize", range = c(0, 1)), color = "Gas"))+
+  geom_line(aes(x = 1:length(temp[[4]])/365 + 2015, y = normalize(as.numeric(temp[[4]]), method = "standardize", range = c(0, 1)), color = "Hard Coal"))+
+  geom_line(aes(x = 1:length(temp[[9]])/365 + 2015, y = normalize(as.numeric(temp[[9]]), method = "standardize", range = c(0, 1)), color = "Lignite"))+
+  geom_line(aes(x = 1:length(temp[[11]])/365 + 2015, y = normalize(as.numeric(temp[[11]]), method = "standardize", range = c(0, 1)), color = "Oil")) + xlab("Year") + ylab("Normalised Power Generated") + ggtitle("Fossil Fuel Generation Trends")
+
+temp[[]] %>% 
+  ggplot()+
+  geom_smooth(aes(x = 1:length(temp[[2]])/365 + 2015, y = normalize(as.numeric(temp[[2]]), method = "standardize", range = c(0, 1)), color = "Gas"))+
+  geom_smooth(aes(x = 1:length(temp[[4]])/365 + 2015, y = normalize(as.numeric(temp[[4]]), method = "standardize", range = c(0, 1)), color = "Hard Coal"))+
+  geom_smooth(aes(x = 1:length(temp[[9]])/365 + 2015, y = normalize(as.numeric(temp[[9]]), method = "standardize", range = c(0, 1)), color = "Lignite"))+
+  geom_smooth(aes(x = 1:length(temp[[11]])/365 + 2015, y = normalize(as.numeric(temp[[11]]), method = "standardize", range = c(0, 1)), color = "Oil")) + xlab("Year") + ylab("Normalised Power Generated")
+
+```
+```{r, include=TRUE, fig.width = 14, fig.height = 6, warning=FALSE, message = FALSE}
+library(seastests)
+library(ggfortify)
+library(zoo)
+library(tseries)
+library(astsa)
+library(BBmisc)
+library(forecast)
+library(ggplot2)
+datain <- long_gen_data %>% group_by(generation_source, year, month, day) %>% summarise(across(c(value), c(max, min, mean)))
+datain <- datain %>%
+  mutate(date = make_datetime(year, month, day))
+p <- list()
+names <- unique(datain$generation_source)
+temp <- list()
+for(i in 1:length(names)){
+  datain2 <- filter(datain, generation_source == names[i])
+  print(datain2$generation_source[1])
+  Vector1<-ts(as.numeric(datain2$value_3), frequency = 365, start = c(2015, 1))
+  decomposed<-decompose(Vector1,type='additive')
+  summary(decomposed)
+  temp[[i]] <- decomposed$seasonal
+  p[[i]] <- autoplot(decomposed) + ggtitle(names[i] )
+}
+
+temp[[]] %>% 
+  ggplot()+
+  geom_smooth(aes(x = 1:length(temp[[4]])/365 + 2015, y = normalize(as.numeric(temp[[4]]), method = "standardize", range = c(0, 1)), color = "Hard Coal"))+
+  geom_smooth(aes(x = 1:length(temp[[7]])/365 + 2015, y = normalize(as.numeric(temp[[7]]), method = "standardize", range = c(0, 1)), color = "Hydro River"))+
+   xlab("Year") + ylab("Normalised Power Generated (seasonal contibution)") + ggtitle("Seasonal Contribution")
+
+temp[[]] %>% 
+  ggplot()+
+  geom_smooth(aes(x = 1:length(temp[[4]])/365 + 2015, y = as.numeric(temp[[4]]), color = "Hard Coal"))+
+  geom_smooth(aes(x = 1:length(temp[[7]])/365 + 2015, y = as.numeric(temp[[7]]),  color = "Hydro River"))+
+   xlab("Year") + ylab(" Power Generated (seasonal contibution)") + ggtitle("Seasonal Contribution")
+
+
+temp[[]] %>% 
+  ggplot()+
+  geom_smooth(aes(x = 1:length(temp[[4]])/365 + 2015, y = as.numeric(temp[[4]]), color = "Hard Coal"))+
+  geom_smooth(aes(x = 1:length(temp[[7]])/365 + 2015, y = as.numeric(temp[[7]]),  color = "Hydro River"))+
+   xlab("Year") + ylab(" Power Generated (seasonal contibution)") + ggtitle("Seasonal Contribution")
+
+```
+
+Worth re looking at hydro pumped - overall generation has remained constant while article read suggests that energy demand has gone up - could this be a good indicator of energy surplus? Explains why there would be a downward trend. (names[8], val3)
+
+
+```{r, include=TRUE, fig.width = 14, fig.height = 36, warning=FALSE, message = FALSE}
+
+datain <- long_gen_data %>% group_by(generation_source, year, day, month) %>% summarise(across(c(value), c(max, min, mean)))
+
+datain <- datain %>%
+  mutate(date = make_date(year, month, day))
+p <- list()
+names <- unique(datain$generation_source)
+for(i in 1:length(names)){
+  datain2 <- filter(datain, generation_source == names[i])
+  p[[i]] <- datain2 %>% ggplot()+geom_line(aes(x = date, y = value_1, color = "max"))+geom_line(aes(x = date, y = value_2, color = "min"))+theme(legend.position="bottom")+ggtitle(names[i])+
+  stat_smooth(formula = y ~ x,method = "lm", col = "red",aes(x = date, y = value_1))+
+  stat_smooth(formula = y ~ x, method = "lm", col = "blue",aes(x = date, y = value_2)) + stat_smooth(formula = y ~ x, method = "lm", col = "green",aes(x = date, y = value_3))
+
+}
+
+do.call(grid.arrange,c(p,ncol=2))
+```
+
+-   mostly parallel suggesting max and minimum load on the grid for each type remains fairly constant despite overall changes in level.
+-   Notable exemptions to this include oil where max has decreased in proportion. Hydro Pumped where max is decreasing, solar where max is decreasing in comparison.
+-   Overall decreasing trends: hard coal, biomass, oil, wind onshore, other, lignite
+-   Overall increasing trends: Gas, waste, other renewable, hydro river step changes seen in:
+-   hard coal, mid 2016 - mid 2017, increase
+-   gas, mid 2016 - mid 2017, increase
+-   Hydro Reservoir, mid 2016 - mid 2017, decrease
+-   Hydro river, mid 2016 - mid 2017, decrease
+-   lignite, mid 2016 - mid 2017, increase
+-   oil, start 2016, drop
+-   other renewable, 2016 start, 2017 start, increase \*other, 2016 start decrease
+
+##### Daily average violin plots
+
+```{r, include=TRUE, fig.width = 14, fig.height = 36}
+q <- list()
+
+for(i in 1:length(names)){
+  datain2 <- filter(datain, generation_source == names[i])
+  q[[i]] <-  ggplot(datain2 ) + geom_violin(aes(x = 1, y = value_2))+ geom_violin(aes(x = 2, y = value_1)) + geom_boxplot(aes(x = 1, y = value_2), width=0.1)+ geom_boxplot(aes(x = 2, y = value_1), width=0.1)+ggtitle(names[i])}
+
+do.call(grid.arrange,c(q,ncol=2))
+```
+
+Looking at violin plots for max and min:
+
+-   clear preferred modes eg nuclear three defined levels in both
+-   three overall trends - show predominant variation in max / min or equal in both
+
+##### Monthly averages
+
+```{r, include=TRUE, fig.width = 14, fig.height = 36}
+
+
+#long_gen_data[is.na(long_gen_data)] <- mean(long_gen_data$value)
+
+datain <- long_gen_data %>% group_by(generation_source, year, month) %>% summarise(across(c(value), c(max, min, mean)))
+datain2 <- datain %>%
+  mutate(date = make_date(year, month))
+
+names <- unique(datain2$generation_source)
+for(i in 1:length(names)){
+  datain3 <- filter(datain2, generation_source == names[i])
+  p[[i]] <- datain3 %>% ggplot()+geom_line(aes(x = date, y = value_1, color = "max"))+geom_line(aes(x = date, y = value_2, color = "min"))+geom_line(aes(x = date, y = value_3, color = "mean")) +theme(legend.position="bottom")+ggtitle(names[i])
+}
+
+do.call(grid.arrange,c(p,ncol=2))
+```
